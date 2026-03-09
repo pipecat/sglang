@@ -533,6 +533,234 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+@triton.jit
+def fused_moe_kernel_splitk(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,  # partial results buffer: (SPLIT_K, EM, N)
+    a_scale_ptr,
+    b_scale_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    # Block size for block-wise quantization
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
+    per_channel_quant: tl.constexpr,
+    even_Ks: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Split-K variant of fused_moe_kernel. Each program computes a partial
+    sum over K // SPLIT_K elements and writes to a temporary buffer.
+    Supports bf16, fp8 (tensor/channel/block-wise). No bias, no int8_w8a16,
+    no gptq_awq — those paths stay on the original kernel."""
+    pid = tl.program_id(axis=0)
+    pid_sk = tl.program_id(axis=1)
+
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        return  # reduce kernel will handle zeroing
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Split K range for this split
+    k_per_split = tl.cdiv(K, SPLIT_K)
+    k_start = pid_sk * k_per_split
+    k_end = min(k_start + k_per_split, K)
+    num_k_blocks = tl.cdiv(k_end - k_start, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am
+        + (k_start + offs_k[None, :]) * stride_ak
+    )
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + ((k_start + offs_k[:, None]) * stride_bk + offs_bn[None, :] * stride_bn)
+    )
+
+    if use_fp8_w8a8 or use_int8_w8a8:
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+            )
+        elif per_channel_quant:
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+        else:
+            a_scale = tl.load(a_scale_ptr)
+            b_scale = tl.load(b_scale_ptr + off_experts)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, num_k_blocks):
+        abs_k = k_start + k * BLOCK_SIZE_K
+        if even_Ks and (k_start + num_k_blocks * BLOCK_SIZE_K <= K):
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < k_end - abs_k),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_end - abs_k, other=0.0)
+
+        if use_fp8_w8a8 or use_int8_w8a8:
+            if group_k > 0 and group_n > 0:
+                offs_ks = abs_k // group_k
+                a_s = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                b_s = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+            else:
+                if use_fp8_w8a8:
+                    accumulator = tl.dot(a, b, acc=accumulator)
+                else:
+                    accumulator += tl.dot(a, b)
+        else:
+            accumulator += tl.dot(a, b)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if use_fp8_w8a8 or use_int8_w8a8:
+        if group_k == 0 or group_n == 0:
+            accumulator *= a_scale * b_scale
+
+    # Write partial result to (pid_sk, token, n) in the temp buffer
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # c_ptr layout: (SPLIT_K, num_valid_tokens, N)
+    c_ptrs = (
+        c_ptr
+        + pid_sk * (num_valid_tokens * N)  # offset for this split
+        + stride_cm * offs_token[:, None]
+        + stride_cn * offs_cn[None, :]
+    )
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator.to(compute_type), mask=c_mask)
+
+
+@triton.jit
+def fused_moe_splitk_reduce(
+    # Pointers
+    partial_ptr,  # (SPLIT_K, num_valid_tokens, N)
+    out_ptr,      # same layout as original C
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Dimensions
+    N,
+    EM,
+    num_valid_tokens,
+    # Strides for output
+    stride_out_m,
+    stride_out_n,
+    # Meta
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Reduce SPLIT_K partial sums and apply topk_weights."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+
+    if off_experts == -1:
+        # Write zeros for filtered experts
+        out_ptrs = out_ptr + stride_out_m * offs_token[:, None] + stride_out_n * offs_cn[None, :]
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type), mask=c_mask)
+        return
+
+    # Sum partial results across SPLIT_K
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for sk in range(SPLIT_K):
+        p_ptrs = (
+            partial_ptr
+            + sk * (num_valid_tokens * N)
+            + offs_token[:, None] * N
+            + offs_cn[None, :]
+        )
+        partial = tl.load(p_ptrs, mask=c_mask, other=0.0)
+        accumulator += partial.to(tl.float32)
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator *= moe_weight[:, None]
+
+    out_ptrs = out_ptr + stride_out_m * offs_token[:, None] + stride_out_n * offs_cn[None, :]
+    tl.store(out_ptrs, accumulator.to(compute_type), mask=c_mask)
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -557,6 +785,7 @@ def invoke_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    split_k: int = 1,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -666,6 +895,93 @@ def invoke_fused_moe_kernel(
         )
 
     else:
+
+        if split_k > 1 and not (use_int8_w8a16 or bias is not None):
+            # Split-K path: better SM utilization for small batch
+            N_val = B.shape[1]
+            K_val = B.shape[2] - padded_size
+            EM_val = sorted_token_ids.shape[0]
+            num_valid = topk_ids.numel()
+
+            # Allocate temporary buffer for partial results
+            partial = torch.zeros(
+                (split_k, num_valid, N_val),
+                device=A.device,
+                dtype=A.dtype if not (use_fp8_w8a8 or use_int8_w8a8)
+                else (torch.bfloat16 if compute_type == tl.bfloat16 else torch.float16),
+            )
+
+            grid_sk = lambda META: (
+                triton.cdiv(EM_val, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N_val, META["BLOCK_SIZE_N"]),
+                split_k,
+            )
+
+            fused_moe_kernel_splitk[grid_sk](
+                A,
+                B,
+                partial,
+                A_scale,
+                B_scale,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                N_val,
+                K_val,
+                EM_val,
+                num_valid,
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                N_val,  # stride_cm: partial is contiguous (num_valid, N)
+                1,      # stride_cn
+                A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+                A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+                B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+                B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                0 if block_shape is None else block_shape[0],
+                0 if block_shape is None else block_shape[1],
+                top_k=top_k,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                per_channel_quant=per_channel_quant,
+                even_Ks=even_Ks,
+                SPLIT_K=split_k,
+                **config,
+            )
+
+            # Reduce partial sums
+            BLOCK_N_REDUCE = config.get("BLOCK_SIZE_N", 64)
+            BLOCK_M_REDUCE = config.get("BLOCK_SIZE_M", 16)
+            grid_reduce = (
+                triton.cdiv(EM_val, BLOCK_M_REDUCE),
+                triton.cdiv(N_val, BLOCK_N_REDUCE),
+            )
+
+            fused_moe_splitk_reduce[grid_reduce](
+                partial,
+                C,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                N_val,
+                EM_val,
+                num_valid,
+                C.stride(1),
+                C.stride(2),
+                BLOCK_SIZE_M=BLOCK_M_REDUCE,
+                BLOCK_SIZE_N=BLOCK_N_REDUCE,
+                MUL_ROUTED_WEIGHT=mul_routed_weight,
+                top_k=top_k,
+                compute_type=compute_type,
+                SPLIT_K=split_k,
+            )
+            return
 
         fused_moe_kernel[grid](
             A,

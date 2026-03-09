@@ -385,6 +385,7 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
+    moe_split_k: int = 1
     elastic_ep_backend: Literal[None, "mooncake"] = None
     mooncake_ib_device: Optional[str] = None
 
@@ -2810,6 +2811,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dense_tp_size,
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
+        parser.add_argument(
+            "--moe-split-k",
+            type=int,
+            default=ServerArgs.moe_split_k,
+            help="Split-K factor for MoE triton kernel to improve SM utilization with small batch sizes. Default 1 (disabled). Recommended 8-32 for small batch RL workloads.",
         )
         parser.add_argument(
             "--elastic-ep-backend",

@@ -125,6 +125,7 @@ IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
+MOE_SPLIT_K: int = 1
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -136,6 +137,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    global MOE_SPLIT_K
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -147,6 +149,7 @@ def initialize_moe_config(server_args: ServerArgs):
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
+    MOE_SPLIT_K = getattr(server_args, "moe_split_k", 1)
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -154,6 +157,10 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
     if MOE_A2A_BACKEND is None:
         MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return MOE_A2A_BACKEND
+
+
+def get_moe_split_k() -> int:
+    return MOE_SPLIT_K
 
 
 def get_moe_runner_backend() -> MoeRunnerBackend:

@@ -29,6 +29,15 @@ from .moe_align_block_size import moe_align_block_size
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
+
+def _get_split_k() -> int:
+    """Get the global moe_split_k setting. Returns 1 if not configured."""
+    try:
+        from sglang.srt.layers.moe.utils import get_moe_split_k
+        return get_moe_split_k()
+    except (ImportError, AttributeError):
+        return 1
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -425,6 +434,8 @@ def fused_experts_impl(
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
+    split_k = _get_split_k()
+
     if no_combine:
         assert not inplace
         out_hidden_states = torch.empty(
@@ -490,6 +501,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            split_k=split_k,
         )
         if activation == "silu":
             if gemm1_alpha is not None:
@@ -544,6 +556,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            split_k=split_k,
         )
 
         if routed_scaling_factor is None:
